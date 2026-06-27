@@ -1,0 +1,35 @@
+17:57:22 | INFO    | ============================================================
+17:57:22 | INFO    | US Inflation Forecasting Pipeline
+17:57:22 | INFO    | ============================================================
+17:57:22 | INFO    | 
+--- Step 1: Data Acquisition ---
+17:57:22 | INFO    | Loaded CPIAUCSL: 1947-01 – 2026-05 (952 obs)
+17:57:22 | INFO    | Loaded POILWTIUSDM: 1992-01 – 2026-05 (413 obs)
+17:57:22 | INFO    | Loaded CIS1020000000000I: 2001-01 – 2026-01 (101 obs)
+17:57:22 | INFO    | Loaded A191RI1Q225SBEA: 1947-04 – 2026-01 (316 obs)
+17:57:22 | INFO    | Loaded PCE: 1959-01 – 2026-05 (809 obs)
+17:57:22 | INFO    | Loaded PPIACO: 1913-01 – 2026-05 (1361 obs)
+17:57:22 | INFO    | Loaded FRBATLWGTUMHWGO: 1997-01 – 2026-05 (352 obs)
+17:57:24 | INFO    | Fetched INDPRO (Industrial Production Index): 1950-01 – 2026-05 (917 obs)
+17:57:24 | INFO    | Fetched TCU (Capacity Utilization): 1967-01 – 2026-05 (713 obs)
+17:57:25 | INFO    | Fetched UNRATE (Unemployment Rate): 1950-01 – 2026-05 (916 obs)
+17:57:26 | INFO    | Fetched PAYEMS (Total Nonfarm Payrolls): 1950-01 – 2026-05 (917 obs)
+17:57:26 | INFO    | Fetched SP500 (S&P 500 Index): 2016-06 – 2026-06 (2514 obs)
+17:57:27 | INFO    | Fetched GS10 (10-Year Treasury Yield): 1953-04 – 2026-05 (878 obs)
+17:57:27 | INFO    | Fetched M2SL (M2 Money Supply): 1959-01 – 2026-05 (809 obs)
+17:57:28 | INFO    | Fetched BAA (Moody's Baa Bond Yield): 1950-01 – 2026-05 (917 obs)
+17:57:29 | INFO    | Fetched TWEXBPA (Trade Weighted Dollar Index): 1973-01 – 2019-12 (564 obs)
+17:57:29 | INFO    | Fetched FEDFUNDS (Federal Funds Rate): 1954-07 – 2026-05 (863 obs)
+17:57:29 | INFO    | 
+--- Step 2: Preprocessing ---
+17:57:29 | INFO    | Interpolating CIS1020000000000I from quarterly → monthly
+17:57:29 | INFO    | Interpolating A191RI1Q225SBEA from quarterly → monthly
+17:57:30 | INFO    | Dropped 4 columns with < 50% non-NaN
+17:57:30 | INFO    | 80% predictor availability from 1959-01
+17:57:30 | INFO    | Final dataset: 711 obs × 13 predictors (1967-01 – 2026-05)
+17:57:30 | INFO    | 
+--- Generating Figure 1 ---
+17:57:31 | INFO    | Saved Figure 1 to Output/figure_1_inflation_series.png
+17:57:31 | INFO    | 
+--- Step 3/4: Rolling Window Evaluation (window=96) ---
+17:57:31 | INFO    | OOS period starts at 2007-12 (index 491)
