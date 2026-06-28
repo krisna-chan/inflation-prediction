@@ -29,7 +29,6 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from scipy.interpolate import CubicSpline
 from scipy import stats as scipy_stats
 import matplotlib
 matplotlib.use('Agg')
@@ -43,6 +42,8 @@ from sklearn.ensemble import (
 from sklearn.linear_model import LassoCV
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
+from sklearn.inspection import permutation_importance as sk_perm_importance
 from statsmodels.tsa.ar_model import AutoReg
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
@@ -155,14 +156,10 @@ def _to_end_of_month(series):
 
 
 def interpolate_quarterly_to_monthly(series, new_index):
-    """Cubic-spline interpolation of a quarterly series to monthly frequency."""
-    # Map dates to numeric (days since epoch) for spline
-    x_old = np.array([d.toordinal() for d in series.index], dtype=float)
-    y_old = series.values.astype(float)
-    x_new = np.array([d.toordinal() for d in new_index], dtype=float)
-    cs = CubicSpline(x_old, y_old, bc_type='natural')
-    interpolated = cs(x_new)
-    return pd.Series(interpolated, index=new_index)
+    """Forward-fill interpolation of a quarterly series to monthly frequency.
+    Uses ffill instead of cubic spline to avoid leaking future information
+    into the training window."""
+    return series.reindex(new_index).ffill()
 
 
 def preprocess_data(local, fred):
@@ -218,31 +215,11 @@ def preprocess_data(local, fred):
     else:
         raise ValueError('CPIAUCSL is required for target computation')
 
-    # --- short-gap cubic spline interpolation ---
+    # --- forward fill remaining gaps (no future-leaking splines) ---
     for col in df.columns:
         if col == 'INFLATION':
             continue
-        # Only interpolate gaps up to 6 months
-        masked = df[col].copy()
-        n_missing = masked.isna().sum()
-        if n_missing > 0:
-            # Use time-based interpolation for gaps
-            good = ~masked.isna()
-            if good.sum() >= 4:
-                x_old = np.array([d.toordinal() for d in df.index[good]], dtype=float)
-                y_old = masked[good].values.astype(float)
-                x_all = np.array([d.toordinal() for d in df.index], dtype=float)
-                try:
-                    cs = CubicSpline(x_old, y_old, bc_type='natural', extrapolate=False)
-                    interpolated = cs(x_all)
-                    # Only fill where we can interpolate (not extrapolate)
-                    fill_mask = np.isnan(masked.values) & ~np.isnan(interpolated)
-                    masked.values[fill_mask] = interpolated[fill_mask]
-                except Exception:
-                    pass
-            # Forward fill remaining small gaps
-            masked.ffill(inplace=True)
-            df[col] = masked
+        df[col] = df[col].ffill(limit=6)
 
     # --- drop predictors that are almost all NaN ---
     min_obs = int(len(df) * 0.5)
@@ -293,10 +270,10 @@ def preprocess_data(local, fred):
 # ---------------------------------------------------------------------------
 # 3. models
 # ---------------------------------------------------------------------------
-def train_ar(y_train, y_test_prev, max_lag=12):
+def train_ar(y_train, y_test_prev, max_lag=12, steps=1):
     """
     AR(p) model with optimal lag chosen by AIC.
-    Returns forecast for next value given y_test_prev (last known values).
+    Forecasts `steps` ahead from the end of y_train.
     """
     best_aic = np.inf
     best_model = None
@@ -314,22 +291,14 @@ def train_ar(y_train, y_test_prev, max_lag=12):
         except Exception:
             continue
     if best_model is None:
-        # fallback to p=1
         best_model = AutoReg(y_train, lags=1, old_names=False).fit()
         best_lag = 1
 
-    # Build combined series for prediction
-    # We need the last best_lag observations from y_train (which includes y_test_prev
-    # if test has started, or just the tail of training)
-    # But actually: y_train ends at time t, and we need to forecast t+h.
-    # For h=1, we need (y_t, y_{t-1}, ..., y_{t-p+1}) which are in y_train.
     combined = np.concatenate([y_train, y_test_prev]) if len(y_test_prev) > 0 else y_train
-    # Use the last best_lag values
     last_vals = combined[-best_lag:] if len(combined) >= best_lag else combined
-    # Pad if needed
     if len(last_vals) < best_lag:
         last_vals = np.pad(last_vals, (best_lag - len(last_vals), 0), mode='edge')
-    return best_model.forecast(steps=1, exog=None)[0]
+    return best_model.forecast(steps=steps, exog=None)[-1]
 
 
 def _ts_cv_split(n_samples, n_splits=5):
@@ -349,7 +318,7 @@ def train_gbdt(X_train, y_train, X_test):
     base = GradientBoostingRegressor(random_state=RANDOM_STATE)
     gs = GridSearchCV(
         base, param_grid,
-        cv=TimeSeriesSplit(n_splits=5),
+        cv=TimeSeriesSplit(n_splits=3, max_train_size=96),
         scoring='neg_mean_squared_error',
         n_jobs=-1, verbose=0,
     )
@@ -358,16 +327,19 @@ def train_gbdt(X_train, y_train, X_test):
 
 
 def train_lasso(X_train, y_train, X_test):
-    """LASSO with cross-validated alpha."""
+    """LASSO with cross-validated alpha and standardized features."""
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test.reshape(1, -1))
     alphas = [0.001, 0.01, 0.1, 1]
     model = LassoCV(
         alphas=alphas,
-        cv=TimeSeriesSplit(n_splits=5),
+        cv=TimeSeriesSplit(n_splits=3, max_train_size=96),
         random_state=RANDOM_STATE,
         max_iter=10000,
     )
-    model.fit(X_train, y_train)
-    return model.predict(X_test.reshape(1, -1))[0], model
+    model.fit(X_train_scaled, y_train)
+    return model.predict(X_test_scaled)[0], model
 
 
 def train_rf(X_train, y_train, X_test):
@@ -379,7 +351,7 @@ def train_rf(X_train, y_train, X_test):
     base = RandomForestRegressor(random_state=RANDOM_STATE)
     gs = GridSearchCV(
         base, param_grid,
-        cv=TimeSeriesSplit(n_splits=5),
+        cv=TimeSeriesSplit(n_splits=3, max_train_size=96),
         scoring='neg_mean_squared_error',
         n_jobs=-1, verbose=0,
     )
@@ -448,7 +420,8 @@ def evaluate(
     df = df.sort_index()
 
     y = df['INFLATION'].values
-    predictor_cols = [c for c in df.columns if c != 'INFLATION']
+    # Drop CPIAUCSL level: it's redundant with 6 lags of inflation (its pct_change)
+    predictor_cols = [c for c in df.columns if c not in ('INFLATION', 'CPIAUCSL')]
     X = df[predictor_cols].values
     dates = df.index
 
@@ -464,7 +437,7 @@ def evaluate(
     models = ['AR', 'GBDT', 'LASSO', 'RF', 'Comb']
     results = {}
     for h in horizons:
-        results[h] = {m: {'forecasts': [], 'actuals': []} for m in models}
+        results[h] = {m: {'forecasts': [], 'actuals': [], 'dates': []} for m in models}
 
     # For variable importance collection (h=1 only)
     vi_predictions = {}  # predictor -> list of forecasts when zeroed
@@ -484,19 +457,12 @@ def evaluate(
 
             # --- Feature building ---
             # Use predictors and lags of inflation
-            if h == 1:
-                X_train_raw = X[train_start:train_end]
-                X_test_raw = X[t]
-            else:
-                # For longer horizons, training uses t - window_size .. t - h
-                X_train_raw = X[train_start:train_end + 1 - h]
-                X_test_raw = X[t]
+            X_train_raw = X[train_start:train_end]
+            X_test_raw = X[t]
 
             # Add lagged inflation as features for ML models
-            # Lags: π_{t-1}, π_{t-2}, ..., π_{t-12}
-            n_lags = 6  # Use 6 lags for ML
-            def _build_ml_features(data_idx, target_idx):
-                """Build feature matrix with lagged inflation + predictors."""
+            n_lags = 6
+            def _build_ml_features(data_idx):
                 features = []
                 for i in data_idx:
                     lag_vals = []
@@ -509,33 +475,32 @@ def evaluate(
                     features.append(row)
                 return np.array(features)
 
-            # Training features for ML
+            # --- Horizon-correct training ---
+            # Feature at index i, label at y[i+h]
+            # train_indices range ensures last label = y[t] (known at time t)
             train_indices = list(range(train_start, train_end + 1 - h))
             if len(train_indices) < n_lags + 1:
                 continue
-            # Skip first n_lags indices to match the target alignment
-            X_train_ml = _build_ml_features(train_indices[n_lags:], None)
+            feat_indices = train_indices[n_lags:]
+            X_train_ml = _build_ml_features(feat_indices)
+            y_train_ml = y[np.array(feat_indices) + h]
 
-            # Test feature for ML
-            X_test_ml = _build_ml_features([t], None)[0]
+            # Test feature for ML (from current time t, predict t+h)
+            X_test_ml = _build_ml_features([t])[0]
 
-            # AR: only uses lags of inflation
-            y_train_ar = y[train_start:train_end + 1 - h]
-            # Previous values for AR (needed for recursive)
-            y_prev_ar = np.array([])  # We'll use the end of y_train_ar
+            # AR: train on y up to t, forecast h steps
+            y_train_ar = y[train_start:train_end + 1]
+            y_ar_forecast = train_ar(y_train_ar, np.array([]), steps=h)
 
             # --- Train models ---
-            # AR
-            y_ar_forecast = train_ar(y_train_ar, np.array([]))
-
             # GBDT
-            y_gbdt_forecast, gbdt_model = train_gbdt(X_train_ml, y[train_start + n_lags:train_end + 1 - h], X_test_ml)
+            y_gbdt_forecast, gbdt_model = train_gbdt(X_train_ml, y_train_ml, X_test_ml)
 
             # LASSO
-            y_lasso_forecast, lasso_model = train_lasso(X_train_ml, y[train_start + n_lags:train_end + 1 - h], X_test_ml)
+            y_lasso_forecast, lasso_model = train_lasso(X_train_ml, y_train_ml, X_test_ml)
 
             # RF
-            y_rf_forecast, rf_model = train_rf(X_train_ml, y[train_start + n_lags:train_end + 1 - h], X_test_ml)
+            y_rf_forecast, rf_model = train_rf(X_train_ml, y_train_ml, X_test_ml)
 
             # Combination
             y_comb_forecast = (y_gbdt_forecast + y_lasso_forecast + y_rf_forecast) / 3.0
@@ -552,22 +517,17 @@ def evaluate(
             for model_name, fc in forecast_map.items():
                 results[h][model_name]['forecasts'].append(fc)
                 results[h][model_name]['actuals'].append(y_actual)
+                results[h][model_name]['dates'].append(dates[test_idx])
 
-            # Variable importance (only h=1, track GBDT, LASSO, RF)
+            # Variable importance (h=1 only, via random substitution from training distribution)
             if h == 1:
                 for mod_name, mod_obj in [('GBDT', gbdt_model), ('LASSO', lasso_model), ('RF', rf_model)]:
                     for j, col in enumerate(predictor_cols):
-                        # Zero out the predictor (or permute)
                         X_test_perm = X_test_ml.copy()
-                        # Offset by n_lags to get predictor index
                         pred_idx_in_ml = n_lags + j
-                        X_test_perm[pred_idx_in_ml] = 0.0
-                        if mod_name == 'GBDT':
-                            perm_fc = mod_obj.predict(X_test_perm.reshape(1, -1))[0]
-                        elif mod_name == 'LASSO':
-                            perm_fc = mod_obj.predict(X_test_perm.reshape(1, -1))[0]
-                        else:
-                            perm_fc = mod_obj.predict(X_test_perm.reshape(1, -1))[0]
+                        rng = np.random.RandomState(RANDOM_STATE + t + j)
+                        X_test_perm[pred_idx_in_ml] = rng.choice(X_train_raw[:, j])
+                        perm_fc = mod_obj.predict(X_test_perm.reshape(1, -1))[0]
 
                         key = (mod_name, col)
                         if key not in vi_predictions:
@@ -791,27 +751,27 @@ def plot_inflation_series(df):
     plt.close(fig)
 
 
-def save_predictions(results):
-    """Save all forecasts to a CSV file."""
+def save_predictions(results, output_name='predictions_fixed.csv'):
+    """Save all forecasts to a CSV file, including dates."""
     records = []
     for h, model_results in results.items():
         for model_name, data in model_results.items():
+            dates = data.get('dates', [])
             n = len(data['forecasts'])
             if n == 0:
                 continue
-            # We need dates – use the first n actuals dates
-            # results doesn't store dates, so we approximate
             for i in range(n):
+                d = dates[i].strftime('%Y-%m-%d') if i < len(dates) else ''
                 records.append({
                     'horizon': h,
                     'model': model_name,
-                    'forecast_idx': i,
+                    'date': d,
                     'forecast': data['forecasts'][i],
                     'actual': data['actuals'][i],
                 })
     out_df = pd.DataFrame(records)
-    out_df.to_csv(OUTPUT_DIR / 'predictions.csv', index=False)
-    logger.info('Saved predictions to Output/predictions.csv (%d rows)', len(out_df))
+    out_df.to_csv(OUTPUT_DIR / output_name, index=False)
+    logger.info('Saved predictions to Output/%s (%d rows)', output_name, len(out_df))
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +849,7 @@ def main():
     print_tables(metrics)
 
     # Save predictions
-    save_predictions(results)
+    save_predictions(results, output_name='predictions_fixed.csv')
 
     # ---- Step 6: Variable Importance ----
     logger.info('\n--- Step 6: Variable Importance ---')
