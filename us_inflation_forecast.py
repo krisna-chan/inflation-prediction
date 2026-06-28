@@ -41,7 +41,7 @@ from sklearn.ensemble import (
 )
 from sklearn.linear_model import LassoCV
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import permutation_importance as sk_perm_importance
 from statsmodels.tsa.ar_model import AutoReg
@@ -813,7 +813,183 @@ def robustness_checks(
 
 
 # ---------------------------------------------------------------------------
-# 9. main pipeline
+# 9. evaluation diagnostics (added by evaluator)
+# ---------------------------------------------------------------------------
+
+def evaluate_forecasts(y_true, y_pred_ar, y_pred_ml, model_name, h):
+    mse_ar = mean_squared_error(y_true, y_pred_ar)
+    mse_ml = mean_squared_error(y_true, y_pred_ml)
+    rmse_ml = np.sqrt(mse_ml)
+    mae_ml = mean_absolute_error(y_true, y_pred_ml)
+
+    r2_oos = 1 - (mse_ml / mse_ar)
+
+    true_diff = np.diff(y_true, prepend=np.nan)
+    pred_diff = y_pred_ml - np.roll(y_true, 1)
+    valid_idx = ~np.isnan(true_diff) & ~np.isnan(pred_diff)
+    directional_acc = np.mean(np.sign(true_diff[valid_idx]) == np.sign(pred_diff[valid_idx])) * 100
+
+    e_ar = y_true - y_pred_ar
+    e_ml = y_true - y_pred_ml
+    f_t = e_ar**2 - e_ml**2 + (y_pred_ar - y_pred_ml)**2
+    cw_stat = np.sqrt(len(f_t)) * np.mean(f_t) / np.std(f_t, ddof=1)
+    p_value = 1 - norm.cdf(cw_stat)
+
+    print(f"=== {model_name} (h={h}) ===")
+    print(f"RMSE: {rmse_ml:.6f}")
+    print(f"MAE:  {mae_ml:.6f}")
+    print(f"R\u00b2_OOS (vs AR): {r2_oos:.4f}")
+    print(f"Directional Acc: {directional_acc:.1f}%")
+    print(f"CW Stat: {cw_stat:.3f} (p={p_value:.4f})")
+    print("-" * 40)
+
+    return {
+        'model': model_name,
+        'horizon': h,
+        'rmse': rmse_ml,
+        'mae': mae_ml,
+        'r2_oos': r2_oos,
+        'dir_acc': directional_acc,
+        'cw_stat': cw_stat,
+        'cw_p': p_value,
+    }
+
+
+def sub_period_analysis(results, horizons=(3, 5)):
+    """Output B: Sub-period RMSE for AR and Comb."""
+    periods = [
+        ('2008\u20132019 (Low Inflation)', '2008-01-01', '2019-12-31'),
+        ('2020\u20132021 (COVID Shock)',   '2020-01-01', '2021-12-31'),
+        ('2022\u20132026 (Post-COVID)',    '2022-01-01', '2026-12-31'),
+    ]
+    print('\n' + '=' * 90)
+    print('OUTPUT B: SUB-PERIOD ROBUSTNESS (RMSE)')
+    print('=' * 90)
+    for h in horizons:
+        print(f'\n--- Horizon h={h} ---')
+        header = f"{'Period':<35} {'AR':<12} {'Comb':<12} {'Winner':<12}"
+        print(header)
+        print('-' * 70)
+        dates = np.array(results[h]['Comb']['dates'])
+        ar_fc = np.array(results[h]['AR']['forecasts'])
+        ar_act = np.array(results[h]['AR']['actuals'])
+        comb_fc = np.array(results[h]['Comb']['forecasts'])
+        comb_act = np.array(results[h]['Comb']['actuals'])
+        comb_wins_all = True
+        for label, start, end in periods:
+            mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
+            n = mask.sum()
+            if n < 2:
+                print(f"{label:<35} {'N/A':<12} {'N/A':<12} {'N/A':<12}")
+                continue
+            rmse_ar = np.sqrt(np.mean((ar_act[mask] - ar_fc[mask])**2))
+            rmse_comb = np.sqrt(np.mean((comb_act[mask] - comb_fc[mask])**2))
+            winner = 'Comb' if rmse_comb < rmse_ar else 'AR'
+            if winner != 'Comb':
+                comb_wins_all = False
+            print(f"{label:<35} {rmse_ar:<12.4f} {rmse_comb:<12.4f} {winner:<12}")
+        if not comb_wins_all:
+            flag = "*** BRITTLE REGIME-DEPENDENT MODEL: Comb loses in one or more sub-periods ***"
+            print(f"\n  {flag}")
+    print('-' * 90)
+
+
+def rolling_rmse_plot(results, h=3, window=12):
+    """Output C: 12-month rolling RMSE for AR vs Comb at horizon h."""
+    dates = np.array(results[h]['Comb']['dates'])
+    ar_act = np.array(results[h]['AR']['actuals'])
+    ar_fc = np.array(results[h]['AR']['forecasts'])
+    comb_fc = np.array(results[h]['Comb']['forecasts'])
+    comb_act = np.array(results[h]['Comb']['actuals'])
+
+    ar_errors_sq = (ar_act - ar_fc)**2
+    comb_errors_sq = (comb_act - comb_fc)**2
+
+    rolling_ar = np.full(len(ar_errors_sq), np.nan)
+    rolling_comb = np.full(len(comb_errors_sq), np.nan)
+
+    for i in range(window - 1, len(ar_errors_sq)):
+        rolling_ar[i] = np.sqrt(np.mean(ar_errors_sq[i - window + 1:i + 1]))
+        rolling_comb[i] = np.sqrt(np.mean(comb_errors_sq[i - window + 1:i + 1]))
+
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    ax.plot(dates, rolling_ar, color='red', linestyle='--', linewidth=0.9, label='AR (12mo rolling RMSE)')
+    ax.plot(dates, rolling_comb, color='steelblue', linestyle='-', linewidth=0.9, label='Comb (12mo rolling RMSE)')
+    ax.set_ylabel('RMSE')
+    ax.set_title(f'Rolling {window}-month RMSE — AR vs Combination (h={h})')
+    ax.legend(loc='upper right', framealpha=0.9)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    fig.savefig(OUTPUT_DIR / 'rolling_rmse_h3.png', dpi=150)
+    logger.info('Saved rolling RMSE plot to Output/rolling_rmse_h3.png')
+    plt.close(fig)
+
+
+def output_a_table(metrics, horizons=(1, 3, 5)):
+    """Output A: Consolidated diagnostic table."""
+    models_order = ['AR', 'GBDT', 'LASSO', 'RF', 'Comb']
+    print('\n' + '=' * 90)
+    print('OUTPUT A: CONSOLIDATED DIAGNOSTIC TABLE')
+    print('=' * 90)
+    print(f"{'Model':<10}" + ''.join(f"{f'h={h} RMSE':<14}{f'h={h} R\u00b2':<14}{f'h={h} CW-p':<14}" for h in horizons))
+    print('-' * 90)
+    for m in models_order:
+        row = f"{m:<10}"
+        for h in horizons:
+            if m in metrics.get(h, {}):
+                rmse = metrics[h][m]['rmse']
+                r2 = metrics[h][m]['r2_oos']
+                cw_p = metrics[h][m]['cw_pval']
+                row += f"{rmse:<14.4f}{r2:<14.2%}{cw_p:<14.4f}"
+            else:
+                row += f"{'N/A':<14}{'N/A':<14}{'N/A':<14}"
+        print(row)
+    print('=' * 90)
+
+
+def run_evaluation_diagnostics(results, metrics, df):
+    """Run Outputs A, B, C, D."""
+    output_a_table(metrics)
+    sub_period_analysis(results, horizons=(3, 5))
+    rolling_rmse_plot(results, h=3, window=12)
+
+    # Output D: Final Verdict
+    print('\n' + '=' * 90)
+    print('OUTPUT D: FINAL VERDICT')
+    print('=' * 90)
+    ml_models = ['GBDT', 'LASSO', 'RF', 'Comb']
+    any_significant = False
+    for h in [1, 3, 5]:
+        for m in ml_models:
+            if h in metrics and m in metrics[h]:
+                p = metrics[h][m]['cw_pval']
+                if not np.isnan(p) and p < 0.10:
+                    any_significant = True
+
+    if any_significant:
+        print("Statistically significant improvement over AR at the 10% level.")
+    else:
+        print("No statistical evidence that ML models outperform the AR benchmark.")
+
+    # Basis point saving for h=1 best ML model
+    best_bp = 0
+    best_ml = None
+    for m in ml_models:
+        if 1 in metrics and m in metrics[1]:
+            rmse_ar = metrics[1]['AR']['rmse']
+            rmse_ml = metrics[1][m]['rmse']
+            bp = (rmse_ar - rmse_ml) * 100
+            if bp > best_bp:
+                best_bp = bp
+                best_ml = m
+    if best_ml:
+        print(f"Economic significance: at h=1, {best_ml} reduces RMSE by {best_bp:.1f} basis points "
+              f"per forecast relative to AR.")
+    print('=' * 90)
+
+
+# ---------------------------------------------------------------------------
+# 10. main pipeline
 # ---------------------------------------------------------------------------
 def main():
     logger.info('=' * 60)
@@ -911,6 +1087,10 @@ def main():
         print(f'Top predictor (GBDT): {top_var}')
 
     print(f'\nOutput files saved to {OUTPUT_DIR}/')
+
+    # ---- Diagnostics ----
+    run_evaluation_diagnostics(results, metrics, df)
+
     logger.info('Pipeline complete.')
 
 
