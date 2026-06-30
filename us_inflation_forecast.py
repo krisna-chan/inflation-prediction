@@ -31,7 +31,9 @@ import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
 import matplotlib
-matplotlib.use('Agg')
+import os
+if not os.environ.get('DISPLAY') and not os.environ.get('MPLBACKEND'):
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -47,6 +49,17 @@ from sklearn.inspection import permutation_importance as sk_perm_importance
 from statsmodels.tsa.ar_model import AutoReg
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
+
+try:
+    from tqdm.autonotebook import tqdm
+    HAS_TQDM = True
+except ImportError:
+    try:
+        from tqdm import tqdm
+        HAS_TQDM = True
+    except ImportError:
+        tqdm = None
+        HAS_TQDM = False
 
 # ---------------------------------------------------------------------------
 # setup
@@ -443,7 +456,10 @@ def evaluate(
     vi_predictions = {}  # predictor -> list of forecasts when zeroed
 
     # Train/test indicators for each horizon
-    for t in range(oos_start_idx, len(df) - max(horizons)):
+    step_range = range(oos_start_idx, len(df) - max(horizons))
+    total_steps = len(step_range)
+    step_iter = tqdm(step_range, desc="Rolling window", total=total_steps) if HAS_TQDM else step_range
+    for t in step_iter:
         # Training range: [t - window_size, t]
         train_start = t - window_size
         train_end = t  # inclusive
